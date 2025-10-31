@@ -19,7 +19,7 @@
    [app.common.types.component :as ctk]
    [app.common.types.container :as ctn]
    [app.common.types.modifiers :as ctm]
-   [app.common.types.shape :as shape]
+   [app.common.types.path :as path]
    [app.common.types.shape-tree :as ctst]
    [app.common.types.shape.attrs :refer [editable-attrs]]
    [app.common.types.shape.layout :as ctl]
@@ -191,30 +191,6 @@
       (d/not-empty? position-data)
       (assoc :position-data position-data))))
 
-(defn update-grow-type
-  [shape old-shape]
-  (let [auto-width? (= :auto-width (:grow-type shape))
-        auto-height? (= :auto-height (:grow-type shape))
-
-        changed-width? (> (mth/abs (- (:width shape) (:width old-shape))) 0.1)
-        changed-height? (> (mth/abs (- (:height shape) (:height old-shape))) 0.1)
-
-        ;; Check if the shape is in a flex layout context that might cause layout-driven changes
-        ;; We should be more conservative about converting auto-width to fixed when the shape
-        ;; is part of a layout system that could cause automatic resizing
-        has-layout-item-sizing? (or (:layout-item-h-sizing shape) (:layout-item-v-sizing shape))
-
-        ;; Only convert auto-width to fixed if:
-        ;; 1. For auto-width: both width AND height changed (indicating user manipulation, not layout)
-        ;; 2. For auto-height: only height changed
-        ;; 3. The shape is not in a layout context where automatic sizing changes are expected
-        change-to-fixed? (and (not has-layout-item-sizing?)
-                              (or (and auto-width? changed-width? changed-height?)
-                                  (and auto-height? changed-height?)))]
-    (cond-> shape
-      change-to-fixed?
-      (assoc :grow-type :fixed))))
-
 (defn- set-wasm-props!
   [objects prev-wasm-props wasm-props]
   (let [;; Set old value for previous properties
@@ -227,21 +203,26 @@
         wasm-props
         (concat clean-props wasm-props)
 
-        wasm-props
+        ;; Stores a map shape -> set of properties changed
+        ;; this is the standard format used by process-shape-changes
+        shape-changes
         (-> (group-by first wasm-props)
-            (update-vals #(map second %)))]
+            (update-vals #(into #{} (map (comp :property second)) %)))
 
-    ;; Props are grouped by id and then assoc to the shape the new value
-    (doseq [[id properties] wasm-props]
-      (let [shape
-            (->> properties
-                 (reduce
-                  (fn [shape {:keys [property value]}]
-                    (assoc shape property value))
-                  (get objects id)))]
-
-        ;; With the new values to the shape change multi props
-        (wasm.shape/set-wasm-multi-attrs! shape (->> properties (map :property)))))))
+        ;; Create a new objects only with the temporary modifications
+        objects-changed
+        (->> wasm-props
+             (reduce
+              (fn [objects [id properties]]
+                (let [shape
+                      (->> properties
+                           (reduce
+                            (fn [shape {:keys [property value]}]
+                              (assoc shape property value))
+                            (get objects id)))]
+                  (assoc objects id shape)))
+              objects))]
+    (wasm.shape/process-shape-changes! objects-changed shape-changes)))
 
 (defn clear-local-transform []
   (ptk/reify ::clear-local-transform
@@ -640,17 +621,20 @@
 
 #_:clj-kondo/ignore
 (defn apply-wasm-modifiers
-  [modif-tree & {:keys [ignore-constraints ignore-snap-pixel snap-ignore-axis undo-group]
-                 :or {ignore-constraints false ignore-snap-pixel false snap-ignore-axis nil undo-group nil}
+  [modif-tree & {:keys [ignore-constraints ignore-snap-pixel snap-ignore-axis undo-transation?]
+                 :or {ignore-constraints false ignore-snap-pixel false snap-ignore-axis nil undo-transation? true}
                  :as params}]
   (ptk/reify ::apply-wasm-modifiesr
     ptk/WatchEvent
     (watch [_ state _]
+      (wasm.api/clean-modifiers)
+      (let [structure-entries (parse-structure-modifiers modif-tree)]
+        (wasm.api/set-structure-modifiers structure-entries))
+
       (let [objects          (dsh/lookup-page-objects state)
 
             ignore-tree
-            (binding [shape/*wasm-sync* false]
-              (calculate-ignore-tree modif-tree objects))
+            (calculate-ignore-tree modif-tree objects)
 
             options
             (-> params
@@ -682,12 +666,34 @@
                     modifiers   (dm/get-in modif-tree [shape-id :modifiers])]
                 (-> shape
                     (gsh/apply-transform transform)
-                    (ctm/apply-structure-modifiers modifiers))))]
-        (rx/of
-         (clear-local-transform)
-         (ptk/event ::dwg/move-frame-guides {:ids ids :transforms transforms})
-         (ptk/event ::dwcm/move-frame-comment-threads transforms)
-         (dwsh/update-shapes ids update-shape options))))))
+                    (ctm/apply-structure-modifiers modifiers))))
+
+            bool-ids
+            (into #{}
+                  (comp
+                   (mapcat (partial cfh/get-parents-with-self objects))
+                   (filter cfh/bool-shape?)
+                   (map :id))
+                  ids)
+
+            undo-id (js/Symbol)]
+        (rx/concat
+         (if undo-transation?
+           (rx/of (dwu/start-undo-transaction undo-id))
+           (rx/empty))
+         (rx/of
+          (clear-local-transform)
+          (ptk/event ::dwg/move-frame-guides {:ids ids :transforms transforms})
+          (ptk/event ::dwcm/move-frame-comment-threads transforms)
+          (dwsh/update-shapes ids update-shape options)
+
+          ;; The update to the bool path needs to be in a different operation because it
+          ;; needs to have the updated children info
+          (dwsh/update-shapes bool-ids path/update-bool-shape (assoc options :with-objects? true)))
+
+         (if undo-transation?
+           (rx/of (dwu/commit-undo-transaction undo-id))
+           (rx/empty)))))))
 
 (def ^:private
   xf-rotation-shape
@@ -810,9 +816,7 @@
                 (-> shape
                     (gsh/transform-shape modifiers)
                     (cond-> (d/not-empty? pos-data)
-                      (assoc-position-data pos-data shape))
-                    (cond-> text-shape?
-                      (update-grow-type shape)))))]
+                      (assoc-position-data pos-data shape)))))]
 
         (rx/of (ptk/event ::dwg/move-frame-guides {:ids ids-with-children :modifiers object-modifiers})
                (ptk/event ::dwcm/move-frame-comment-threads ids-with-children)
@@ -857,23 +861,20 @@
             (rx/empty))))))))
 
 ;; Pure function to determine next grow-type for text layers
-(defn next-grow-type [current-grow-type resize-direction]
+(defn next-grow-type
+  [current-grow-type scalev]
   (cond
     (= current-grow-type :fixed)
     :fixed
 
-    (and (= resize-direction :horizontal)
-         (= current-grow-type :auto-width))
-    :auto-height
-
-    (and (= resize-direction :horizontal)
-         (= current-grow-type :auto-height))
-    :auto-height
-
-    (and (= resize-direction :vertical)
+    (and (not (mth/close? (:y scalev) 1.0))
          (or (= current-grow-type :auto-width)
              (= current-grow-type :auto-height)))
     :fixed
+
+    (and (not (mth/close? (:x scalev) 1.0))
+         (= current-grow-type :auto-width))
+    :auto-height
 
     :else
     current-grow-type))
